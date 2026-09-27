@@ -1,4 +1,4 @@
-"""RAG utilities plus safe, incremental background PDF indexing."""
+"""RAG utilities with incremental indexing for local Ollama or cloud Gemini."""
 from __future__ import annotations
 
 import hashlib
@@ -20,11 +20,11 @@ load_dotenv()
 ROOT = Path(__file__).parent
 DOCUMENTS_DIR = ROOT / "data" / "documents"
 STORAGE_DIR = ROOT / "storage" / "chroma"
-MANIFEST_PATH = ROOT / "storage" / "index_manifest.json"
-COLLECTION_NAME = "university_documents"
+OLLAMA_COLLECTION_NAME = "university_documents"  # Preserves the existing local index.
+GEMINI_COLLECTION_NAME = "university_documents_gemini"
 
-# One process may only write to Chroma at a time. Reads deliberately do not use
-# this lock, so retrieval remains available while a PDF is being embedded.
+# A single worker and write lock prevent unsafe concurrent Chroma writes. Reads
+# intentionally take no write lock, so questions remain available while indexing.
 _WRITE_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-indexer")
@@ -43,34 +43,69 @@ class AppConfig:
     chunk_overlap: int
 
 
+def _setting(name: str, default: str | None = None) -> str | None:
+    """Read .env locally and Streamlit Cloud Secrets when deployed."""
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        import streamlit as st
+
+        secret = st.secrets.get(name)
+        return str(secret) if secret is not None else default
+    except Exception:
+        return default
+
+
 def config() -> AppConfig:
-    provider = os.getenv("LLM_PROVIDER", "openai").lower()
-    if provider not in {"openai", "ollama"}:
-        raise ValueError("LLM_PROVIDER must be 'openai' or 'ollama'.")
-    ollama = provider == "ollama"
+    provider = (_setting("LLM_PROVIDER", "ollama") or "ollama").lower()
+    if provider not in {"ollama", "gemini"}:
+        raise ValueError("Unsupported LLM provider. Use 'ollama' or 'gemini'.")
+    is_ollama = provider == "ollama"
+    api_key = "ollama" if is_ollama else _setting("GEMINI_API_KEY")
+    if not is_ollama and not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing. Add it to Streamlit Cloud Secrets.")
     return AppConfig(
         provider=provider,
-        api_key="ollama" if ollama else os.getenv("OPENAI_API_KEY"),
-        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1") if ollama else None,
-        chat_model=os.getenv("OLLAMA_CHAT_MODEL", "llama3.2") if ollama else os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini"),
-        embedding_model=os.getenv("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") if ollama else os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"),
-        top_k=int(os.getenv("TOP_K", "3")),
-        chunk_size=int(os.getenv("CHUNK_SIZE", "1200")),
-        chunk_overlap=int(os.getenv("CHUNK_OVERLAP", "100")),
+        api_key=api_key,
+        base_url=_setting("OLLAMA_BASE_URL", "http://localhost:11434/v1") if is_ollama else None,
+        chat_model=_setting("OLLAMA_CHAT_MODEL", "llama3.2") if is_ollama else _setting("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
+        embedding_model=_setting("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") if is_ollama else _setting("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"),
+        top_k=int(_setting("TOP_K", "3") or "3"),
+        chunk_size=int(_setting("CHUNK_SIZE", "1200") or "1200"),
+        chunk_overlap=int(_setting("CHUNK_OVERLAP", "100") or "100"),
     )
 
 
-def client() -> OpenAI:
+def ollama_client() -> OpenAI:
     cfg = config()
-    if cfg.provider == "openai" and not cfg.api_key:
-        raise RuntimeError("OPENAI_API_KEY is missing. Add it to your .env file.")
-    return OpenAI(api_key=cfg.api_key, base_url=cfg.base_url)
+    if cfg.provider != "ollama":
+        raise RuntimeError("Ollama client requested while Ollama is not selected.")
+    return OpenAI(api_key="ollama", base_url=cfg.base_url)
+
+
+def gemini_client():
+    cfg = config()
+    if cfg.provider != "gemini":
+        raise RuntimeError("Gemini client requested while Gemini is not selected.")
+    try:
+        from google import genai
+    except ImportError as error:
+        raise RuntimeError("Gemini support is not installed. Run: pip install -r requirements.txt") from error
+    return genai.Client(api_key=cfg.api_key)
 
 
 def collection():
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    name = OLLAMA_COLLECTION_NAME if config().provider == "ollama" else GEMINI_COLLECTION_NAME
     db = chromadb.PersistentClient(path=str(STORAGE_DIR))
-    return db.get_or_create_collection(name=COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+    return db.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+
+
+def _manifest_path() -> Path:
+    # Keep the original Ollama manifest. Gemini needs a separate manifest because
+    # the two providers generate vectors with different dimensions.
+    return ROOT / "storage" / ("index_manifest.json" if config().provider == "ollama" else "index_manifest_gemini.json")
 
 
 def split_text(text: str, size: int, overlap: int) -> list[str]:
@@ -98,9 +133,25 @@ def read_pdf_pages(path: Path) -> Iterable[tuple[int, str]]:
         yield page_number, page.extract_text() or ""
 
 
-def embed(texts: list[str]) -> list[list[float]]:
-    response = client().embeddings.create(model=config().embedding_model, input=texts)
-    return [item.embedding for item in response.data]
+def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
+    """Embed text through the selected provider without duplicating RAG logic."""
+    cfg = config()
+    try:
+        if cfg.provider == "ollama":
+            response = ollama_client().embeddings.create(model=cfg.embedding_model, input=texts)
+            return [item.embedding for item in response.data]
+        from google.genai import types
+
+        response = gemini_client().models.embed_content(
+            model=cfg.embedding_model,
+            contents=texts,
+            config=types.EmbedContentConfig(task_type=task_type),
+        )
+        return [item.values for item in response.embeddings]
+    except Exception as error:
+        if cfg.provider == "ollama":
+            raise RuntimeError("Ollama is not running or the configured model is unavailable. Start Ollama and try again.") from error
+        raise RuntimeError("Gemini embedding request failed. Verify the Gemini API key and configured embedding model.") from error
 
 
 def file_hash(path: Path) -> str:
@@ -113,26 +164,25 @@ def file_hash(path: Path) -> str:
 
 def _read_manifest() -> dict[str, str]:
     try:
-        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        return json.loads(_manifest_path().read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
 
 def _write_manifest(manifest: dict[str, str]) -> None:
-    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = MANIFEST_PATH.with_suffix(".tmp")
+    path = _manifest_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    temporary.replace(MANIFEST_PATH)
+    temporary.replace(path)
 
 
 def _set_job(filename: str, **changes: object) -> None:
     with _STATE_LOCK:
-        current = _JOBS.setdefault(filename, {"filename": filename})
-        current.update(changes)
+        _JOBS.setdefault(filename, {"filename": filename}).update(changes)
 
 
 def indexing_snapshot() -> list[dict[str, object]]:
-    """Thread-safe job state for the Streamlit thread. No session state is used."""
     with _STATE_LOCK:
         return [dict(job) for job in _JOBS.values()]
 
@@ -142,11 +192,11 @@ def indexing_in_progress() -> bool:
 
 
 def _ids_for(target, where: dict[str, str]) -> list[str]:
-    result = target.get(where=where, include=[])
-    return list(result.get("ids", []))
+    return list(target.get(where=where, include=[]).get("ids", []))
 
 
 def _index_one_file(path: Path) -> None:
+    """Background worker task. It never touches Streamlit session state."""
     filename = path.name
     try:
         _set_job(filename, state="indexing", message="Calculating document fingerprint…", indexed_chunks=0)
@@ -154,22 +204,17 @@ def _index_one_file(path: Path) -> None:
         _set_job(filename, file_hash=current_hash)
         target = collection()
 
-        # A manifest makes repeated app starts cheap. For a pre-existing index
-        # created by older app versions, a matching filename is adopted once
-        # rather than re-embedded.
         with _WRITE_LOCK:
             manifest = _read_manifest()
             same_hash_ids = _ids_for(target, {"file_hash": current_hash})
             existing_source_ids = _ids_for(target, {"source": filename})
-            if same_hash_ids:
+            if same_hash_ids or (manifest.get(filename) == current_hash and existing_source_ids):
                 manifest[filename] = current_hash
                 _write_manifest(manifest)
                 _set_job(filename, state="complete", message="Already indexed; skipped.", indexed_chunks=0)
                 return
-            if manifest.get(filename) == current_hash and existing_source_ids:
-                _set_job(filename, state="complete", message="Already indexed; skipped.", indexed_chunks=0)
-                return
-            if filename not in manifest and existing_source_ids:
+            if filename not in manifest and existing_source_ids and config().provider == "ollama":
+                # Adopt the pre-Gemini local index once without re-embedding it.
                 manifest[filename] = current_hash
                 _write_manifest(manifest)
                 _set_job(filename, state="complete", message="Existing index adopted; skipped.", indexed_chunks=0)
@@ -185,17 +230,15 @@ def _index_one_file(path: Path) -> None:
         if not records:
             raise RuntimeError("No extractable text was found. Use a text-based PDF or run OCR first.")
 
-        # Embed first. If this fails, no existing Chroma records are changed.
+        # Finish embedding before changing the collection. A failed embedding
+        # therefore preserves old chunks for a modified document.
         batches: list[tuple[list[tuple[str, str, dict[str, object]]], list[list[float]]]] = []
         batch_size = 64
         for offset in range(0, len(records), batch_size):
             batch = records[offset : offset + batch_size]
             _set_job(filename, state="indexing", message=f"Embedding passages {offset + 1}-{min(offset + len(batch), len(records))} of {len(records)}…", indexed_chunks=offset)
-            batches.append((batch, embed([record[1] for record in batch])))
+            batches.append((batch, embed([record[1] for record in batch], "RETRIEVAL_DOCUMENT")))
 
-        # The short write section is serialized. New records are committed before
-        # old same-filename records are removed, so a failed update preserves the
-        # prior document and never affects unrelated PDFs.
         _set_job(filename, state="indexing", message="Saving to knowledge base…", indexed_chunks=0)
         with _WRITE_LOCK:
             target = collection()
@@ -219,7 +262,7 @@ def _index_one_file(path: Path) -> None:
 
 
 def enqueue_unindexed_documents(paths: Iterable[Path]) -> int:
-    """Queue files for background incremental indexing; returns newly queued count."""
+    """Queue only new/changed PDFs and return immediately to Streamlit."""
     queued = 0
     for path in paths:
         if path.suffix.lower() != ".pdf" or not path.exists():
@@ -234,8 +277,7 @@ def enqueue_unindexed_documents(paths: Iterable[Path]) -> int:
                 continue
         with _STATE_LOCK:
             prior = _JOBS.get(filename, {})
-            state = prior.get("state")
-            if state in {"queued", "indexing"} or (state == "failed" and prior.get("file_hash") == current_hash):
+            if prior.get("state") in {"queued", "indexing"} or (prior.get("state") == "failed" and prior.get("file_hash") == current_hash):
                 continue
             _JOBS[filename] = {"filename": filename, "file_hash": current_hash, "state": "queued", "message": "Waiting to be indexed…", "indexed_chunks": 0}
         _INDEX_EXECUTOR.submit(_index_one_file, path)
@@ -243,29 +285,12 @@ def enqueue_unindexed_documents(paths: Iterable[Path]) -> int:
     return queued
 
 
-def index_documents(rebuild: bool = False) -> tuple[int, int]:
-    """Compatibility helper: incrementally indexes only new/changed PDFs.
-
-    ``rebuild`` is intentionally ignored: normal application use never deletes
-    the Chroma collection or re-embeds unchanged files.
-    """
-    files = sorted(DOCUMENTS_DIR.glob("*.pdf"))
-    if not files:
-        raise RuntimeError("No PDFs found. Put university documents in data/documents/.")
-    before = collection().count()
-    for path in files:
-        _index_one_file(path)
-    return len(files), max(0, collection().count() - before)
-
-
 def retrieve(question: str) -> list[dict[str, object]]:
-    # No write lock here: queries can continue while the background worker is
-    # embedding or committing an unrelated document.
     target = collection()
     count = target.count()
     if count == 0:
         raise RuntimeError("The knowledge base is empty. Add a PDF and wait for indexing to finish.")
-    result = target.query(query_embeddings=embed([question]), n_results=min(config().top_k, count), include=["documents", "metadatas", "distances"])
+    result = target.query(query_embeddings=embed([question], "RETRIEVAL_QUERY"), n_results=min(config().top_k, count), include=["documents", "metadatas", "distances"])
     return [{"text": text, "source": metadata["source"], "page": metadata["page"], "distance": distance} for text, metadata, distance in zip(result["documents"][0], result["metadatas"][0], result["distances"][0])]
 
 
@@ -273,9 +298,28 @@ def answer(question: str, history: list[dict[str, str]] | None = None) -> tuple[
     sources = retrieve(question)
     context = "\n\n".join(f"[Source {number}: {source['source']}, page {source['page']}]\n{source['text']}" for number, source in enumerate(sources, start=1))
     system = """You are a careful university academic assistant. Answer only from the supplied university-document context. Do not invent policies, deadlines, or facts. If the context does not answer the question, say exactly that you could not find it in the indexed university documents. Cite every factual claim with source markers such as [Source 1]. Be concise and helpful."""
-    messages = [{"role": "system", "content": system}]
-    for item in (history or [])[-6:]:
-        messages.append({"role": item["role"], "content": item["content"]})
-    messages.append({"role": "user", "content": f"University-document context:\n{context}\n\nQuestion: {question}"})
-    response = client().chat.completions.create(model=config().chat_model, messages=messages, temperature=0.1)
-    return response.choices[0].message.content or "I could not generate an answer.", sources
+    final_question = f"University-document context:\n{context}\n\nQuestion: {question}"
+    cfg = config()
+    try:
+        if cfg.provider == "ollama":
+            messages = [{"role": "system", "content": system}]
+            for item in (history or [])[-6:]:
+                messages.append({"role": item["role"], "content": item["content"]})
+            messages.append({"role": "user", "content": final_question})
+            response = ollama_client().chat.completions.create(model=cfg.chat_model, messages=messages, temperature=0.1)
+            text = response.choices[0].message.content
+        else:
+            from google.genai import types
+
+            contents = []
+            for item in (history or [])[-6:]:
+                role = "model" if item["role"] == "assistant" else "user"
+                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=item["content"])]))
+            contents.append(types.Content(role="user", parts=[types.Part.from_text(text=final_question)]))
+            response = gemini_client().models.generate_content(model=cfg.chat_model, contents=contents, config=types.GenerateContentConfig(system_instruction=system, temperature=0.1))
+            text = response.text
+    except Exception as error:
+        if cfg.provider == "ollama":
+            raise RuntimeError("Ollama is not running or the configured model is unavailable. Start Ollama and try again.") from error
+        raise RuntimeError("Gemini answer request failed. Verify the Gemini API key and configured chat model.") from error
+    return text or "I could not generate an answer.", sources
