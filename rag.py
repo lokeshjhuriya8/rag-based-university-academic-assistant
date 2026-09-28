@@ -179,10 +179,15 @@ def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[
         # gemini-embedding-001 uses the documented embed_content interface.
         # The same model and returned vector dimension are used for documents
         # and queries; task_type is intentionally not sent here.
-        response = gemini_client().models.embed_content(
-            model=cfg.embedding_model,
-            contents=texts,
-        )
+        # Do not chain ``gemini_client().models...``. Accessing ``.models`` on
+        # a temporary Client can release that Client before the request starts;
+        # its finalizer closes the underlying HTTP client. Keep a strong client
+        # reference for the entire call, then close it after the response exists.
+        with gemini_client() as client:
+            response = client.models.embed_content(
+                model=cfg.embedding_model,
+                contents=texts,
+            )
         embeddings = list(response.embeddings or [])
         if len(embeddings) != len(texts):
             raise RuntimeError(f"Gemini returned {len(embeddings)} embeddings for {len(texts)} input texts.")
@@ -363,10 +368,15 @@ def answer(question: str, history: list[dict[str, str]] | None = None) -> tuple[
                 role = "model" if item["role"] == "assistant" else "user"
                 contents.append(types.Content(role=role, parts=[types.Part.from_text(text=item["content"])]))
             contents.append(types.Content(role="user", parts=[types.Part.from_text(text=final_question)]))
-            response = gemini_client().models.generate_content(model=cfg.chat_model, contents=contents, config=types.GenerateContentConfig(system_instruction=system, temperature=0.1))
+            # Same lifecycle rule as embeddings: keep the SDK client alive until
+            # generate_content has completed; never reuse a closed client.
+            with gemini_client() as client:
+                response = client.models.generate_content(model=cfg.chat_model, contents=contents, config=types.GenerateContentConfig(system_instruction=system, temperature=0.1))
             text = response.text
     except Exception as error:
         if cfg.provider == "ollama":
             raise RuntimeError("Ollama is not running or the configured model is unavailable. Start Ollama and try again.") from error
-        raise RuntimeError("Gemini answer request failed. Verify the Gemini API key and configured chat model.") from error
+        message = _safe_gemini_error(error)
+        LOGGER.warning("Gemini answer request failed: %s", message)
+        raise RuntimeError(f"Gemini answer request failed: {message}") from error
     return text or "I could not generate an answer.", sources
