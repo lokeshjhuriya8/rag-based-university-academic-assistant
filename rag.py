@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -22,6 +24,7 @@ DOCUMENTS_DIR = ROOT / "data" / "documents"
 STORAGE_DIR = ROOT / "storage" / "chroma"
 OLLAMA_COLLECTION_NAME = "university_documents"  # Preserves the existing local index.
 GEMINI_COLLECTION_NAME = "university_documents_gemini"
+LOGGER = logging.getLogger(__name__)
 
 # A single worker and write lock prevent unsafe concurrent Chroma writes. Reads
 # intentionally take no write lock, so questions remain available while indexing.
@@ -65,12 +68,15 @@ def config() -> AppConfig:
     api_key = "ollama" if is_ollama else _setting("GEMINI_API_KEY")
     if not is_ollama and not api_key:
         raise RuntimeError("GEMINI_API_KEY is missing. Add it to Streamlit Cloud Secrets.")
+    embedding_model = _setting("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") if is_ollama else _setting("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+    if not is_ollama and embedding_model != "gemini-embedding-001":
+        raise ValueError("GEMINI_EMBEDDING_MODEL must be 'gemini-embedding-001'.")
     return AppConfig(
         provider=provider,
         api_key=api_key,
         base_url=_setting("OLLAMA_BASE_URL", "http://localhost:11434/v1") if is_ollama else None,
         chat_model=_setting("OLLAMA_CHAT_MODEL", "llama3.2") if is_ollama else _setting("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
-        embedding_model=_setting("OLLAMA_EMBEDDING_MODEL", "nomic-embed-text") if is_ollama else _setting("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001"),
+        embedding_model=embedding_model,
         top_k=int(_setting("TOP_K", "3") or "3"),
         chunk_size=int(_setting("CHUNK_SIZE", "1200") or "1200"),
         chunk_overlap=int(_setting("CHUNK_OVERLAP", "100") or "100"),
@@ -97,7 +103,14 @@ def gemini_client():
 
 def collection():
     STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-    name = OLLAMA_COLLECTION_NAME if config().provider == "ollama" else GEMINI_COLLECTION_NAME
+    cfg = config()
+    # The embedding model becomes part of Gemini's collection identity. This
+    # prevents a model/dimension change from silently mixing incompatible vectors.
+    if cfg.provider == "ollama":
+        name = OLLAMA_COLLECTION_NAME
+    else:
+        model_tag = hashlib.sha256(cfg.embedding_model.encode()).hexdigest()[:10]
+        name = f"{GEMINI_COLLECTION_NAME}_{model_tag}"
     db = chromadb.PersistentClient(path=str(STORAGE_DIR))
     return db.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
 
@@ -105,7 +118,11 @@ def collection():
 def _manifest_path() -> Path:
     # Keep the original Ollama manifest. Gemini needs a separate manifest because
     # the two providers generate vectors with different dimensions.
-    return ROOT / "storage" / ("index_manifest.json" if config().provider == "ollama" else "index_manifest_gemini.json")
+    cfg = config()
+    if cfg.provider == "ollama":
+        return ROOT / "storage" / "index_manifest.json"
+    model_tag = hashlib.sha256(cfg.embedding_model.encode()).hexdigest()[:10]
+    return ROOT / "storage" / f"index_manifest_gemini_{model_tag}.json"
 
 
 def split_text(text: str, size: int, overlap: int) -> list[str]:
@@ -133,6 +150,25 @@ def read_pdf_pages(path: Path) -> Iterable[tuple[int, str]]:
         yield page_number, page.extract_text() or ""
 
 
+def _safe_gemini_error(error: Exception) -> str:
+    """Return a useful API error without ever echoing a credential."""
+    message = str(error).replace("\n", " ")
+    message = re.sub(r"(?i)(api[_ -]?key\s*[=:]\s*)[^\s,;]+", r"\1[redacted]", message)
+    message = re.sub(r"(?i)(key=)[^&\s]+", r"\1[redacted]", message)
+    return message[:700] or error.__class__.__name__
+
+
+def _gemini_vector(embedding: object) -> list[float]:
+    """Support the official SDK's .values field and compatible SDK variants."""
+    values = getattr(embedding, "values", None)
+    if values is None:
+        nested = getattr(embedding, "embedding", None)
+        values = getattr(nested, "values", nested)
+    if values is None:
+        raise RuntimeError("Gemini returned an embedding without vector values.")
+    return list(values)
+
+
 def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
     """Embed text through the selected provider without duplicating RAG logic."""
     cfg = config()
@@ -140,18 +176,29 @@ def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[
         if cfg.provider == "ollama":
             response = ollama_client().embeddings.create(model=cfg.embedding_model, input=texts)
             return [item.embedding for item in response.data]
-        from google.genai import types
-
+        # gemini-embedding-001 uses the documented embed_content interface.
+        # The same model and returned vector dimension are used for documents
+        # and queries; task_type is intentionally not sent here.
         response = gemini_client().models.embed_content(
             model=cfg.embedding_model,
             contents=texts,
-            config=types.EmbedContentConfig(task_type=task_type),
         )
-        return [item.values for item in response.embeddings]
+        embeddings = list(response.embeddings or [])
+        if len(embeddings) != len(texts):
+            raise RuntimeError(f"Gemini returned {len(embeddings)} embeddings for {len(texts)} input texts.")
+        vectors = [_gemini_vector(item) for item in embeddings]
+        if not vectors or any(not vector for vector in vectors):
+            raise RuntimeError("Gemini returned an empty embedding vector.")
+        dimensions = len(vectors[0])
+        if any(len(vector) != dimensions for vector in vectors):
+            raise RuntimeError("Gemini returned inconsistent embedding dimensions.")
+        return vectors
     except Exception as error:
         if cfg.provider == "ollama":
             raise RuntimeError("Ollama is not running or the configured model is unavailable. Start Ollama and try again.") from error
-        raise RuntimeError("Gemini embedding request failed. Verify the Gemini API key and configured embedding model.") from error
+        message = _safe_gemini_error(error)
+        LOGGER.warning("Gemini embedding request failed: %s", message)
+        raise RuntimeError(f"Gemini embedding request failed: {message}") from error
 
 
 def file_hash(path: Path) -> str:
@@ -226,7 +273,7 @@ def _index_one_file(path: Path) -> None:
         for page, text in read_pdf_pages(path):
             for chunk_number, text_chunk in enumerate(split_text(text, settings.chunk_size, settings.chunk_overlap)):
                 chunk_id = hashlib.sha256(f"{current_hash}:{page}:{chunk_number}:{text_chunk}".encode()).hexdigest()
-                records.append((chunk_id, text_chunk, {"source": filename, "file_hash": current_hash, "page": page, "chunk": chunk_number}))
+                records.append((chunk_id, text_chunk, {"source": filename, "file_hash": current_hash, "embedding_model": settings.embedding_model, "page": page, "chunk": chunk_number}))
         if not records:
             raise RuntimeError("No extractable text was found. Use a text-based PDF or run OCR first.")
 
