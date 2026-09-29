@@ -75,7 +75,7 @@ def config() -> AppConfig:
         provider=provider,
         api_key=api_key,
         base_url=_setting("OLLAMA_BASE_URL", "http://localhost:11434/v1") if is_ollama else None,
-        chat_model=_setting("OLLAMA_CHAT_MODEL", "llama3.2") if is_ollama else _setting("GEMINI_CHAT_MODEL", "gemini-2.5-flash-lite"),
+        chat_model=_setting("OLLAMA_CHAT_MODEL", "llama3.2") if is_ollama else _setting("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite"),
         embedding_model=embedding_model,
         top_k=int(_setting("TOP_K", "3") or "3"),
         chunk_size=int(_setting("CHUNK_SIZE", "1200") or "1200"),
@@ -172,6 +172,7 @@ def _gemini_vector(embedding: object) -> list[float]:
 def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[float]]:
     """Embed text through the selected provider without duplicating RAG logic."""
     cfg = config()
+    client = None
     try:
         if cfg.provider == "ollama":
             response = ollama_client().embeddings.create(model=cfg.embedding_model, input=texts)
@@ -179,15 +180,13 @@ def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[
         # gemini-embedding-001 uses the documented embed_content interface.
         # The same model and returned vector dimension are used for documents
         # and queries; task_type is intentionally not sent here.
-        # Do not chain ``gemini_client().models...``. Accessing ``.models`` on
-        # a temporary Client can release that Client before the request starts;
-        # its finalizer closes the underlying HTTP client. Keep a strong client
-        # reference for the entire call, then close it after the response exists.
-        with gemini_client() as client:
-            response = client.models.embed_content(
-                model=cfg.embedding_model,
-                contents=texts,
-            )
+        # Keep a named strong reference until the synchronous request completes.
+        # Client.close() is performed only in finally, after success or failure.
+        client = gemini_client()
+        response = client.models.embed_content(
+            model=cfg.embedding_model,
+            contents=texts,
+        )
         embeddings = list(response.embeddings or [])
         if len(embeddings) != len(texts):
             raise RuntimeError(f"Gemini returned {len(embeddings)} embeddings for {len(texts)} input texts.")
@@ -204,6 +203,13 @@ def embed(texts: list[str], task_type: str = "RETRIEVAL_DOCUMENT") -> list[list[
         message = _safe_gemini_error(error)
         LOGGER.warning("Gemini embedding request failed: %s", message)
         raise RuntimeError(f"Gemini embedding request failed: {message}") from error
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as close_error:
+                # Never replace an API/indexing error with a cleanup error.
+                LOGGER.warning("Gemini client cleanup failed: %s", _safe_gemini_error(close_error))
 
 
 def file_hash(path: Path) -> str:
@@ -352,6 +358,7 @@ def answer(question: str, history: list[dict[str, str]] | None = None) -> tuple[
     system = """You are a careful university academic assistant. Answer only from the supplied university-document context. Do not invent policies, deadlines, or facts. If the context does not answer the question, say exactly that you could not find it in the indexed university documents. Cite every factual claim with source markers such as [Source 1]. Be concise and helpful."""
     final_question = f"University-document context:\n{context}\n\nQuestion: {question}"
     cfg = config()
+    client = None
     try:
         if cfg.provider == "ollama":
             messages = [{"role": "system", "content": system}]
@@ -368,10 +375,9 @@ def answer(question: str, history: list[dict[str, str]] | None = None) -> tuple[
                 role = "model" if item["role"] == "assistant" else "user"
                 contents.append(types.Content(role=role, parts=[types.Part.from_text(text=item["content"])]))
             contents.append(types.Content(role="user", parts=[types.Part.from_text(text=final_question)]))
-            # Same lifecycle rule as embeddings: keep the SDK client alive until
-            # generate_content has completed; never reuse a closed client.
-            with gemini_client() as client:
-                response = client.models.generate_content(model=cfg.chat_model, contents=contents, config=types.GenerateContentConfig(system_instruction=system, temperature=0.1))
+            # Keep the named client alive for the whole synchronous request.
+            client = gemini_client()
+            response = client.models.generate_content(model=cfg.chat_model, contents=contents, config=types.GenerateContentConfig(system_instruction=system, temperature=0.1))
             text = response.text
     except Exception as error:
         if cfg.provider == "ollama":
@@ -379,4 +385,10 @@ def answer(question: str, history: list[dict[str, str]] | None = None) -> tuple[
         message = _safe_gemini_error(error)
         LOGGER.warning("Gemini answer request failed: %s", message)
         raise RuntimeError(f"Gemini answer request failed: {message}") from error
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as close_error:
+                LOGGER.warning("Gemini client cleanup failed: %s", _safe_gemini_error(close_error))
     return text or "I could not generate an answer.", sources

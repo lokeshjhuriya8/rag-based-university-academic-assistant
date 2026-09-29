@@ -49,7 +49,7 @@ Start the application:
 ```toml
 LLM_PROVIDER = "gemini"
 GEMINI_API_KEY = "your-gemini-api-key"
-GEMINI_CHAT_MODEL = "gemini-2.5-flash-lite"
+GEMINI_CHAT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 TOP_K = "3"
 CHUNK_SIZE = "1200"
