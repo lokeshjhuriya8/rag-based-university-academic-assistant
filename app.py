@@ -24,6 +24,13 @@ def add_styles() -> None:
     button[kind="header"],button[data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"] button { background:#0b2d4d !important; color:#fff !important; border:2px solid #075b70 !important; border-radius:5px !important; opacity:1 !important; }
     button[kind="header"] svg,button[data-testid="stSidebarCollapseButton"] svg,[data-testid="stSidebarCollapsedControl"] button svg { color:#fff !important; fill:currentColor !important; opacity:1 !important; }
     .stTextInput input { color:#142b3d !important; background:#fff !important; border:1px solid #56758a !important; border-radius:5px !important; } [data-testid="stExpander"] { background:#fff; border:1px solid #c4d1da; }
+    /* Streamlit's uploaded-file label does not always inherit sidebar text colour. */
+    [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFile"] *,
+    [data-testid="stFileUploaderFileName"], [data-testid="stFileUploaderFileName"] *,
+    [data-testid="stFileUploaderFileData"], [data-testid="stFileUploaderFileData"] *,
+    [data-testid="stFileUploaderFile"] svg {
+        color:#142b3d !important; fill:#142b3d !important; opacity:1 !important;
+    }
     [data-testid="stMetric"] { background:#fff; border:1px solid #c4d1da; border-radius:8px; padding:.7rem; }
     </style>""", unsafe_allow_html=True)
 
