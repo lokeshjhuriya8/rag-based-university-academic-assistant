@@ -10,6 +10,9 @@ A Streamlit chatbot that searches university PDFs before using an LLM to answer.
 4. Retrieves the most relevant passages for each question.
 5. Generates a grounded answer with the active provider and document/page citations.
 6. Indexes new or changed PDFs in one background worker, so existing indexed documents remain searchable during indexing.
+7. Provides a **Document Dashboard** with live document, chunk, indexing and failure metrics.
+8. Lets you safely remove one uploaded PDF and all of that PDF's ChromaDB chunks without rebuilding or affecting other documents.
+9. Generates source-grounded, interactive MCQ quizzes from indexed university documents using the selected Ollama or Gemini provider.
 
 ## Setup
 
@@ -23,6 +26,24 @@ Copy-Item .env.example .env
 ```
 
 Upload PDFs in the sidebar. New or modified files are queued for background indexing automatically; the **Check and index new PDFs** button performs the same non-blocking check manually. The app never deletes the ChromaDB collection during normal use.
+
+## Document management
+
+Open **Document Dashboard** from the sidebar to see live metrics for stored PDFs, indexed chunks, completed documents and documents that are queued, indexing, pending or failed. Each document row shows the file size, active-provider chunk count and current indexing status.
+
+Use **View information** for a concise document summary. To remove a document, select **Delete document** and then confirm the action. The application validates the filename, deletes only that PDF from `data/documents/`, removes chunks with matching `source` metadata from the project's Chroma collections, and updates its manifests. If a document is deleted during background indexing, that worker is prevented from writing orphaned chunks back to ChromaDB.
+
+## AI Quiz Generator
+
+Open **AI Quiz Generator** from the sidebar after one or more text-based PDFs have finished indexing.
+
+1. Choose one indexed PDF or **All indexed documents**.
+2. Choose 5, 10, 15 or 20 questions and an Easy, Medium or Hard difficulty.
+3. Generate the quiz. Questions are created only from bounded, source-labelled indexed passages.
+4. Answer one question at a time with Previous/Next navigation, then submit the quiz.
+5. Review the score, correct answers, explanations and source document/page references.
+
+The model is required to return four options, one answer key, an explanation and a source/page for every question. The application rejects malformed, duplicate or untraceable questions rather than presenting them as a valid quiz. Correct answers remain hidden until quiz submission.
 
 ## Local Ollama setup
 

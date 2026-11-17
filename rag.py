@@ -32,6 +32,9 @@ _WRITE_LOCK = threading.Lock()
 _STATE_LOCK = threading.Lock()
 _INDEX_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pdf-indexer")
 _JOBS: dict[str, dict[str, object]] = {}
+# A deletion may occur while a worker is embedding a document. The worker checks
+# this set before any database write, so it cannot re-add a removed document.
+_CANCELLED_JOBS: set[tuple[str, str]] = set()
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,22 @@ def collection():
         name = f"{GEMINI_COLLECTION_NAME}_{model_tag}"
     db = chromadb.PersistentClient(path=str(STORAGE_DIR))
     return db.get_or_create_collection(name=name, metadata={"hnsw:space": "cosine"})
+
+
+def _persistent_client():
+    """Return the project's persistent Chroma client without changing a collection."""
+    STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    return chromadb.PersistentClient(path=str(STORAGE_DIR))
+
+
+def _managed_collections() -> list[object]:
+    """Return every project collection, including old provider-specific ones."""
+    managed: list[object] = []
+    for item in _persistent_client().list_collections():
+        name = getattr(item, "name", item)
+        if name == OLLAMA_COLLECTION_NAME or str(name).startswith(GEMINI_COLLECTION_NAME):
+            managed.append(item if hasattr(item, "get") else _persistent_client().get_collection(name=str(name)))
+    return managed
 
 
 def _manifest_path() -> Path:
@@ -235,6 +254,139 @@ def _write_manifest(manifest: dict[str, str]) -> None:
     temporary.replace(path)
 
 
+def _all_manifest_paths() -> list[Path]:
+    """Find manifests for local Ollama and every Gemini embedding collection."""
+    storage_root = ROOT / "storage"
+    return [storage_root / "index_manifest.json", *storage_root.glob("index_manifest_gemini_*.json")]
+
+
+def safe_document_path(filename: str) -> Path:
+    """Resolve a PDF name only inside the managed document directory."""
+    if not filename or Path(filename).name != filename or Path(filename).suffix.lower() != ".pdf":
+        raise ValueError("Invalid document name.")
+    documents_root = DOCUMENTS_DIR.resolve()
+    candidate = (documents_root / filename).resolve()
+    try:
+        candidate.relative_to(documents_root)
+    except ValueError as error:
+        raise ValueError("Document path must stay inside data/documents.") from error
+    return candidate
+
+
+def _cancelled(filename: str, document_hash: str) -> bool:
+    with _STATE_LOCK:
+        return (filename, document_hash) in _CANCELLED_JOBS
+
+
+def _metadata_records(target) -> list[tuple[str, dict[str, object], str]]:
+    """Read chunk data once and normalise Chroma's parallel result lists."""
+    result = target.get(include=["documents", "metadatas"])
+    return [
+        (str(chunk_id), metadata or {}, document or "")
+        for chunk_id, metadata, document in zip(
+            result.get("ids", []), result.get("metadatas", []), result.get("documents", [])
+        )
+    ]
+
+
+def document_inventory() -> list[dict[str, object]]:
+    """Return actual files with active-collection chunk counts and job state."""
+    DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        records = _metadata_records(collection())
+    except Exception:
+        records = []
+    chunks_by_source: dict[str, int] = {}
+    for _, metadata, _ in records:
+        source = str(metadata.get("source", ""))
+        if source:
+            chunks_by_source[source] = chunks_by_source.get(source, 0) + 1
+    manifest = _read_manifest()
+    jobs = {str(job.get("filename")): job for job in indexing_snapshot()}
+    inventory: list[dict[str, object]] = []
+    for path in sorted(DOCUMENTS_DIR.glob("*.pdf"), key=lambda item: item.name.lower()):
+        try:
+            current_hash = file_hash(path)
+            size = path.stat().st_size
+        except OSError:
+            continue
+        job = jobs.get(path.name, {})
+        chunks = chunks_by_source.get(path.name, 0)
+        job_state = str(job.get("state", ""))
+        if job_state in {"queued", "indexing"}:
+            status = "Indexing" if job_state == "indexing" else "Queued"
+        elif job_state == "failed" and str(job.get("file_hash", "")) == current_hash:
+            status = "Failed"
+        elif chunks > 0 and (manifest.get(path.name) == current_hash or not manifest.get(path.name)):
+            status = "Indexed"
+        else:
+            status = "Pending"
+        inventory.append(
+            {
+                "name": path.name,
+                "size_bytes": size,
+                "chunks": chunks,
+                "status": status,
+                "message": str(job.get("message", "")),
+            }
+        )
+    return inventory
+
+
+def document_metrics() -> dict[str, int]:
+    """Calculate dashboard metrics from the active collection and disk files."""
+    items = document_inventory()
+    return {
+        "total_documents": len(items),
+        "total_chunks": sum(int(item["chunks"]) for item in items),
+        "indexed_documents": sum(item["status"] == "Indexed" for item in items),
+        "pending_or_failed": sum(item["status"] in {"Pending", "Queued", "Indexing", "Failed"} for item in items),
+    }
+
+
+def delete_document(filename: str) -> dict[str, int | str]:
+    """Delete one managed PDF, its chunks in every provider collection, and manifests."""
+    path = safe_document_path(filename)
+    try:
+        document_hash = file_hash(path) if path.exists() else ""
+    except OSError as error:
+        raise RuntimeError(f"Could not read {filename} before deletion.") from error
+
+    with _STATE_LOCK:
+        if document_hash:
+            _CANCELLED_JOBS.add((filename, document_hash))
+
+    removed_chunks = 0
+    try:
+        with _WRITE_LOCK:
+            for target in _managed_collections():
+                ids = _ids_for(target, {"source": filename})
+                if ids:
+                    target.delete(ids=ids)
+                    removed_chunks += len(ids)
+            for manifest_path in _all_manifest_paths():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (FileNotFoundError, json.JSONDecodeError):
+                    manifest = {}
+                if filename in manifest:
+                    manifest.pop(filename, None)
+                    temporary = manifest_path.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+                    temporary.replace(manifest_path)
+            if path.exists():
+                path.unlink()
+            elif removed_chunks == 0:
+                raise FileNotFoundError(f"{filename} is no longer available.")
+        _set_job(filename, state="deleted", message="Document and indexed chunks removed.", indexed_chunks=0)
+        return {"filename": filename, "removed_chunks": removed_chunks}
+    except Exception:
+        with _STATE_LOCK:
+            if document_hash:
+                _CANCELLED_JOBS.discard((filename, document_hash))
+        raise
+
+
 def _set_job(filename: str, **changes: object) -> None:
     with _STATE_LOCK:
         _JOBS.setdefault(filename, {"filename": filename}).update(changes)
@@ -260,6 +412,9 @@ def _index_one_file(path: Path) -> None:
         _set_job(filename, state="indexing", message="Calculating document fingerprint…", indexed_chunks=0)
         current_hash = file_hash(path)
         _set_job(filename, file_hash=current_hash)
+        if _cancelled(filename, current_hash):
+            _set_job(filename, state="deleted", message="Indexing cancelled because the document was deleted.", indexed_chunks=0)
+            return
         target = collection()
 
         with _WRITE_LOCK:
@@ -299,6 +454,11 @@ def _index_one_file(path: Path) -> None:
 
         _set_job(filename, state="indexing", message="Saving to knowledge base…", indexed_chunks=0)
         with _WRITE_LOCK:
+            # A file can be removed while an embedding request is in flight.
+            # Never write those now-orphaned vectors back into Chroma.
+            if _cancelled(filename, current_hash) or not path.exists():
+                _set_job(filename, state="deleted", message="Indexing cancelled because the document was deleted.", indexed_chunks=0)
+                return
             target = collection()
             old_ids = _ids_for(target, {"source": filename})
             new_ids = {record[0] for batch, _ in batches for record in batch}
@@ -334,6 +494,7 @@ def enqueue_unindexed_documents(paths: Iterable[Path]) -> int:
             if _read_manifest().get(filename) == current_hash:
                 continue
         with _STATE_LOCK:
+            _CANCELLED_JOBS.discard((filename, current_hash))
             prior = _JOBS.get(filename, {})
             if prior.get("state") in {"queued", "indexing"} or (prior.get("state") == "failed" and prior.get("file_hash") == current_hash):
                 continue
@@ -341,6 +502,183 @@ def enqueue_unindexed_documents(paths: Iterable[Path]) -> int:
         _INDEX_EXECUTOR.submit(_index_one_file, path)
         queued += 1
     return queued
+
+
+def _quiz_context(selected_sources: list[str] | None, question_count: int) -> tuple[str, set[tuple[str, int]]]:
+    """Build a bounded, source-labelled context from indexed chunks only."""
+    records = _metadata_records(collection())
+    if not records:
+        raise RuntimeError("The knowledge base is empty. Upload and index a PDF before generating a quiz.")
+    available_sources = {str(metadata.get("source", "")) for _, metadata, _ in records}
+    requested = set(selected_sources or available_sources)
+    if not requested or not requested.issubset(available_sources):
+        raise RuntimeError("Choose documents that have finished indexing before generating a quiz.")
+
+    grouped: dict[str, list[tuple[dict[str, object], str]]] = {}
+    for _, metadata, text in records:
+        source = str(metadata.get("source", ""))
+        if source in requested and text:
+            grouped.setdefault(source, []).append((metadata, text))
+    for items in grouped.values():
+        items.sort(key=lambda item: (int(item[0].get("page", 0)), int(item[0].get("chunk", 0))))
+
+    # Round-robin selection keeps an all-documents quiz from being dominated by
+    # the first large PDF while keeping the prompt bounded for both providers.
+    # Keep the prompt small enough for the local llama3.2 context window while
+    # still sampling enough distinct material for larger quizzes.
+    limit = min(18, max(10, question_count))
+    selected: list[tuple[dict[str, object], str]] = []
+    positions = {source: 0 for source in sorted(grouped)}
+    while len(selected) < limit:
+        added = False
+        for source in sorted(grouped):
+            position = positions[source]
+            if position < len(grouped[source]) and len(selected) < limit:
+                selected.append(grouped[source][position])
+                positions[source] += 1
+                added = True
+        if not added:
+            break
+    if not selected:
+        raise RuntimeError("The selected documents do not have indexed text available for quiz generation.")
+
+    valid_sources: set[tuple[str, int]] = set()
+    blocks: list[str] = []
+    for metadata, text in selected:
+        source = str(metadata["source"])
+        page = int(metadata["page"])
+        valid_sources.add((source, page))
+        blocks.append(f"[Source: {source}; Page: {page}]\n{text[:1400]}")
+    return "\n\n".join(blocks), valid_sources
+
+
+def _extract_json(text: str) -> object:
+    """Extract JSON from a plain response or a Markdown code fence."""
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s*```$", "", cleaned)
+    start_candidates = [position for position in (cleaned.find("["), cleaned.find("{")) if position >= 0]
+    if start_candidates:
+        cleaned = cleaned[min(start_candidates) :]
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("The model returned an invalid quiz format. Please generate a new quiz.") from error
+
+
+def _quiz_text(prompt: str) -> str:
+    """Generate one quiz payload through the already selected provider."""
+    cfg = config()
+    client = None
+    try:
+        if cfg.provider == "ollama":
+            response = ollama_client().chat.completions.create(
+                model=cfg.chat_model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You create accurate university study quizzes and return valid JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            return response.choices[0].message.content or ""
+
+        from google.genai import types
+
+        client = gemini_client()
+        response = client.models.generate_content(
+            model=cfg.chat_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction="You create accurate university study quizzes and return valid JSON only.",
+                temperature=0.2,
+                response_mime_type="application/json",
+            ),
+        )
+        return response.text or ""
+    except Exception as error:
+        if cfg.provider == "ollama":
+            raise RuntimeError("Ollama is not running or the configured model is unavailable. Start Ollama and try again.") from error
+        message = _safe_gemini_error(error)
+        LOGGER.warning("Gemini quiz request failed: %s", message)
+        raise RuntimeError(f"Gemini quiz request failed: {message}") from error
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as close_error:
+                LOGGER.warning("Gemini client cleanup failed: %s", _safe_gemini_error(close_error))
+
+
+def generate_quiz(selected_sources: list[str] | None, question_count: int, difficulty: str) -> list[dict[str, object]]:
+    """Create validated, source-grounded MCQs from currently indexed chunks."""
+    if question_count not in {5, 10, 15, 20}:
+        raise ValueError("Choose 5, 10, 15, or 20 quiz questions.")
+    if difficulty not in {"Easy", "Medium", "Hard"}:
+        raise ValueError("Choose Easy, Medium, or Hard difficulty.")
+    context, valid_sources = _quiz_context(selected_sources, question_count)
+    prompt = f"""Create exactly {question_count} unique {difficulty}-difficulty multiple-choice questions using ONLY the university-document passages below.
+
+Return a JSON array only. Each object must have exactly these fields:
+question (string), options (object with keys A, B, C, D), correct_answer (one of A/B/C/D), explanation (string), source (exact source filename), page (integer).
+
+Rules:
+- Do not use general knowledge or facts not stated in the passages.
+- Make each question distinct; do not repeat the same fact in different wording.
+- All four options must be plausible, but only one may be correct.
+- Keep the explanation short and grounded in the cited passage.
+- Use only a source filename and page pair that appears in the context labels.
+
+Document passages:
+{context}"""
+    payload = _extract_json(_quiz_text(prompt))
+    entries = payload.get("questions", []) if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        raise RuntimeError("The model returned an invalid quiz format. Please generate a new quiz.")
+
+    questions: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        question = str(entry.get("question", "")).strip()
+        options = entry.get("options")
+        correct_answer = str(entry.get("correct_answer", "")).strip().upper()
+        explanation = str(entry.get("explanation", "")).strip()
+        source = str(entry.get("source", "")).strip()
+        try:
+            page = int(entry.get("page"))
+        except (TypeError, ValueError):
+            continue
+        normalised = re.sub(r"\W+", "", question.lower())
+        if (
+            not question
+            or not isinstance(options, dict)
+            or set(options) != {"A", "B", "C", "D"}
+            or any(not str(options[key]).strip() for key in ("A", "B", "C", "D"))
+            or correct_answer not in {"A", "B", "C", "D"}
+            or not explanation
+            or (source, page) not in valid_sources
+            or normalised in seen
+        ):
+            continue
+        seen.add(normalised)
+        questions.append(
+            {
+                "question": question,
+                "options": {key: str(options[key]).strip() for key in ("A", "B", "C", "D")},
+                "correct_answer": correct_answer,
+                "explanation": explanation,
+                "source": source,
+                "page": page,
+            }
+        )
+    if len(questions) != question_count:
+        raise RuntimeError("The model did not return enough valid, source-grounded questions. Please generate a new quiz.")
+    return questions
 
 
 def retrieve(question: str) -> list[dict[str, object]]:
