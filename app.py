@@ -15,23 +15,36 @@ st.set_page_config(page_title="University Academic AI Assistant", page_icon="ðŸŽ
 
 def add_styles() -> None:
     st.markdown("""<style>
-    .stApp { background:#f7f9fc; color:#142b3d; } .block-container { max-width:1120px; padding-top:1.8rem; }
-    h1,h2,h3,p,label,[data-testid="stMarkdownContainer"] { color:#142b3d !important; } h1 { color:#0b2d4d !important; }
-    [data-testid="stSidebar"] { background:#fff; border-right:1px solid #a9bac7; } [data-testid="stSidebar"] * { color:#142b3d; opacity:1; }
+    :root { --ink:#142b3d; --muted:#3f5b6d; --panel:#ffffff; --border:#b9c9d3; }
+    .stApp { background:#f7f9fc; color:var(--ink); } .block-container { max-width:1120px; padding-top:1.8rem; }
+    /* Leave ordinary Streamlit text to inherit its component-specific colours. */
+    h1,h2,h3 { color:#0b2d4d !important; }
+    [data-testid="stSidebar"] { background:var(--panel); border-right:1px solid #a9bac7; }
+    [data-testid="stSidebar"] .stMarkdown, [data-testid="stSidebar"] label, [data-testid="stSidebar"] [data-testid="stWidgetLabel"],
+    [data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color:var(--ink) !important; opacity:1 !important; }
     .stButton > button,.stFormSubmitButton > button,[data-testid="stFileUploaderDropzone"] button { background:#075b70 !important; color:#fff !important; border:1px solid #075b70 !important; border-radius:5px !important; font-weight:700 !important; opacity:1 !important; }
-    .stButton > button *, .stFormSubmitButton > button *, [data-testid="stFileUploaderDropzone"] button *, [data-testid="stFileUploaderDropzone"] svg { color:#fff !important; fill:currentColor !important; opacity:1 !important; }
+    .stButton > button *, .stFormSubmitButton > button *, [data-testid="stFileUploaderDropzone"] button *, [data-testid="stFileUploaderDropzone"] button svg { color:#fff !important; fill:currentColor !important; opacity:1 !important; }
     .stButton > button:hover,.stFormSubmitButton > button:hover,[data-testid="stFileUploaderDropzone"] button:hover { background:#063f4e !important; border-color:#063f4e !important; }
     button[kind="header"],button[data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"] button { background:#0b2d4d !important; color:#fff !important; border:2px solid #075b70 !important; border-radius:5px !important; opacity:1 !important; }
     button[kind="header"] svg,button[data-testid="stSidebarCollapseButton"] svg,[data-testid="stSidebarCollapsedControl"] button svg { color:#fff !important; fill:currentColor !important; opacity:1 !important; }
-    .stTextInput input { color:#142b3d !important; background:#fff !important; border:1px solid #56758a !important; border-radius:5px !important; } [data-testid="stExpander"] { background:#fff; border:1px solid #c4d1da; }
-    /* Streamlit's uploaded-file label does not always inherit sidebar text colour. */
+    .stTextInput input { color:var(--ink) !important; background:var(--panel) !important; border:1px solid #56758a !important; border-radius:5px !important; }
+    [data-testid="stExpander"] { background:var(--panel); border:1px solid #c4d1da; }
+    [data-testid="stMetric"] { background:var(--panel); border:1px solid #c4d1da; border-radius:8px; padding:.7rem; }
+    /* Uploaded-file rows are separate Streamlit components, not ordinary sidebar text. */
     [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFile"] *,
     [data-testid="stFileUploaderFileName"], [data-testid="stFileUploaderFileName"] *,
     [data-testid="stFileUploaderFileData"], [data-testid="stFileUploaderFileData"] *,
-    [data-testid="stFileUploaderFile"] svg {
-        color:#142b3d !important; fill:#142b3d !important; opacity:1 !important;
-    }
-    [data-testid="stMetric"] { background:#fff; border:1px solid #c4d1da; border-radius:8px; padding:.7rem; }
+    [data-testid="stFileUploaderFile"] svg { color:var(--ink) !important; fill:var(--ink) !important; opacity:1 !important; }
+    /* Current and legacy Streamlit alerts need their own foregrounds. */
+    [data-testid="stAlert"], .stAlertContainer { border-radius:6px; }
+    [data-testid="stAlert"] *, .stAlertContainer * { opacity:1 !important; }
+    [data-testid="stAlert"] [data-testid="stMarkdownContainer"],
+    .stAlertContainer [data-testid="stMarkdownContainer"], .stAlertContainer p { color:inherit !important; }
+    [data-testid="stAlert"] svg, .stAlertContainer svg { fill:currentColor !important; }
+    .stAlertContainer:has([data-testid="stAlertContentSuccess"]) { background:#eaf7ef !important; border:1px solid #74b98b !important; color:#135c32 !important; }
+    .stAlertContainer:has([data-testid="stAlertContentWarning"]) { background:#fff7df !important; border:1px solid #d7a72c !important; color:#694d00 !important; }
+    .stAlertContainer:has([data-testid="stAlertContentError"]) { background:#fdecec !important; border:1px solid #d58989 !important; color:#8a1f1f !important; }
+    .stAlertContainer:has([data-testid="stAlertContentInfo"]) { background:#eef5fb !important; border:1px solid #8db5d3 !important; color:#164d72 !important; }
     </style>""", unsafe_allow_html=True)
 
 
