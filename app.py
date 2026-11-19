@@ -41,7 +41,11 @@ def add_styles() -> None:
     [data-testid="stRadio"] [data-testid="stRadioOption"],
     [data-testid="stRadio"] [data-testid="stRadioOption"] *,
     [data-testid="stRadio"] label { color:var(--ink) !important; opacity:1 !important; }
-    [data-testid="stSelectbox"] input, [data-testid="stSelectbox"] [role="combobox"],
+    /* Selectbox values are rendered in an internal input by current Streamlit versions. */
+    [data-testid="stSelectbox"] input, [data-testid="stSelectbox"] [role="combobox"] {
+        color:var(--ink) !important; -webkit-text-fill-color:var(--ink) !important;
+        background-color:var(--panel) !important; caret-color:var(--ink) !important; opacity:1 !important;
+    }
     [data-testid="stSelectbox"] button, [data-testid="stSelectboxVirtualDropdown"] [role="option"],
     [data-testid="stSelectboxVirtualDropdown"] [role="option"] * { color:var(--ink) !important; opacity:1 !important; }
     [data-testid="stSelectbox"] svg { fill:var(--ink) !important; }
