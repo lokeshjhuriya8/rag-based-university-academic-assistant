@@ -30,6 +30,24 @@ def add_styles() -> None:
     .stTextInput input { color:var(--ink) !important; background:var(--panel) !important; border:1px solid #56758a !important; border-radius:5px !important; }
     [data-testid="stExpander"] { background:var(--panel); border:1px solid #c4d1da; }
     [data-testid="stMetric"] { background:var(--panel); border:1px solid #c4d1da; border-radius:8px; padding:.7rem; }
+    /* These widgets have their own theme tokens, so set foregrounds on the light cards explicitly. */
+    [data-testid="stMetricLabel"], [data-testid="stMetricLabel"] *,
+    [data-testid="stMetricValue"], [data-testid="stMetricValue"] * { color:var(--ink) !important; opacity:1 !important; }
+    [data-testid="stWidgetLabel"], [data-testid="stWidgetLabel"] *,
+    [data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] * { color:var(--muted) !important; opacity:1 !important; }
+    [data-testid="stTextInput"] [data-testid="stWidgetLabel"], [data-testid="stTextInput"] [data-testid="stWidgetLabel"] *,
+    [data-testid="stSelectbox"] [data-testid="stWidgetLabel"], [data-testid="stSelectbox"] [data-testid="stWidgetLabel"] *,
+    [data-testid="stRadio"] [data-testid="stWidgetLabel"], [data-testid="stRadio"] [data-testid="stWidgetLabel"] * { color:var(--ink) !important; }
+    [data-testid="stRadio"] [data-testid="stRadioOption"],
+    [data-testid="stRadio"] [data-testid="stRadioOption"] *,
+    [data-testid="stRadio"] label { color:var(--ink) !important; opacity:1 !important; }
+    [data-testid="stSelectbox"] input, [data-testid="stSelectbox"] [role="combobox"],
+    [data-testid="stSelectbox"] button, [data-testid="stSelectboxVirtualDropdown"] [role="option"],
+    [data-testid="stSelectboxVirtualDropdown"] [role="option"] * { color:var(--ink) !important; opacity:1 !important; }
+    [data-testid="stSelectbox"] svg { fill:var(--ink) !important; }
+    [data-testid="stExpander"] summary, [data-testid="stExpander"] summary *,
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"],
+    [data-testid="stExpander"] [data-testid="stMarkdownContainer"] * { color:var(--ink) !important; opacity:1 !important; }
     /* Uploaded-file rows are separate Streamlit components, not ordinary sidebar text. */
     [data-testid="stFileUploaderFile"], [data-testid="stFileUploaderFile"] *,
     [data-testid="stFileUploaderFileName"], [data-testid="stFileUploaderFileName"] *,
